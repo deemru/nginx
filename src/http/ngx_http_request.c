@@ -705,6 +705,197 @@ ngx_http_ssl_handshake(ngx_event_t *rev)
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, rev->log, 0,
                            "https ssl handshake: 0x%02Xd", buf[0]);
 
+// GOST_SWitchPatch BEGIN
+
+            if( ( ( ngx_http_port_t * ) c->listening->servers)->naddrs > 1 &&
+                hc->conf_ctx != ( (ngx_http_in_addr_t *)( (ngx_http_port_t *)
+                c->listening->servers )->addrs )->conf.default_server->ctx )
+            {
+
+#define SWP_MAX_ANALYZE_SIZE    1024
+#define SWP_SSL3_PROLOG_SIZE    5
+#define SWP_SSL3_HANDSHAKE      0x16
+#define SWP_SSL23_CLIENT_HELLO  0x01
+
+#define TLS_CIPHER_2001         0x0081
+#define TLS_CIPHER_2012         0xFF85
+#define IS_GOST_SPEC( suite ) \
+    ( suite == TLS_CIPHER_2001 || suite == TLS_CIPHER_2012 )
+
+#pragma pack (push, 1)
+
+                typedef struct
+                {
+                    unsigned short len;
+                    unsigned char type;
+                    unsigned short version;
+                    unsigned short suiteslen;
+                    unsigned short sidlen;
+                    unsigned short chlen;
+                    // SUITES (3 bytes each)
+                }
+                SWP_SSLv2_hello;
+
+                typedef struct
+                {
+                    unsigned char type;
+                    unsigned short version;
+                    unsigned short len;
+                    unsigned char htype;
+                    unsigned char hlen1;
+                    unsigned short hlen2;
+                    unsigned short version2;
+                    unsigned char random[32];
+                    unsigned char sidlen;
+                    unsigned short suiteslen;
+                    // SUITES (2 bytes each)
+                }
+                SWP_SSLv3_hello;
+
+#pragma pack (pop)
+
+                u_char is_GOST = 1;
+                u_char hello[SWP_MAX_ANALYZE_SIZE];
+                ssize_t hlen;
+
+                hlen = recv( c->fd, (char *)hello, sizeof( hello ), MSG_PEEK );
+
+                err = ngx_socket_errno;
+
+                ngx_log_debug1( NGX_LOG_DEBUG_HTTP, rev->log, 0,
+                                "http recv(): %d", n );
+
+                if( hlen == -1 ) {
+                    if( err == NGX_EAGAIN ) {
+
+                        if( !rev->timer_set ) {
+                            ngx_add_timer( rev,
+                                           c->listening->post_accept_timeout );
+                            ngx_reusable_connection( c, 1 );
+                        }
+
+                        if( ngx_handle_read_event( rev, 0 ) != NGX_OK ) {
+                            ngx_http_close_connection( c );
+                        }
+
+                        return;
+                    }
+
+                    ngx_connection_error( c, err, "recv() failed" );
+                    ngx_http_close_connection( c );
+
+                    return;
+                }
+
+// GOST_SWitchPatch ANALYZE
+
+    for( ;; )
+    {
+        unsigned short  hello_len;
+        unsigned char   sidlen;
+        unsigned short  suiteslen;
+        unsigned        suite;
+        unsigned short  i;
+
+        if( hello[0] & 0x80 )
+        // SSLv2
+        {
+            SWP_SSLv2_hello * v2_hello = (SWP_SSLv2_hello *)hello;
+
+            if( (size_t)hlen < sizeof( SWP_SSLv2_hello ) )
+                break;
+
+            hello_len = ( ( hello[0] & 0x7F ) << 8 ) + hello[1];
+
+            if( hello_len > (unsigned short)hlen )
+                break;
+
+            if( v2_hello->type != SWP_SSL23_CLIENT_HELLO )
+                break;
+            
+            {
+                suiteslen = ntohs( v2_hello->suiteslen );
+
+                if( hello_len < sizeof( SWP_SSLv2_hello ) + suiteslen )
+                    break;
+
+                is_GOST = 0;
+
+                for( i = 0; i < suiteslen / 3; i++ )
+                {
+                    suite = ntohl( *(unsigned *)( hello +
+                         sizeof( SWP_SSLv2_hello ) - 1 + i * 3 ) ) & 0x00FFFFFF;
+
+                    if( IS_GOST_SPEC( suite ) )
+                    {
+                        is_GOST = 1;
+                        break;
+                    }
+                }
+            }
+        }
+        else
+        // SSLv3
+        {
+            SWP_SSLv3_hello * v3_hello = (SWP_SSLv3_hello *)hello;
+
+            hello_len = ntohs( v3_hello->len ) + SWP_SSL3_PROLOG_SIZE;
+
+            if( hello_len > (unsigned short)hlen )
+                break;
+
+            if( v3_hello->type != SWP_SSL3_HANDSHAKE )
+                break;
+
+            if( v3_hello->htype != SWP_SSL23_CLIENT_HELLO )
+                break;
+
+            {
+                sidlen = v3_hello->sidlen;
+
+                if( hello_len < sizeof( SWP_SSLv3_hello ) + sidlen )
+                    break;
+                
+                {
+                    v3_hello = (SWP_SSLv3_hello *)( hello + sidlen );
+
+                    suiteslen = ntohs( v3_hello->suiteslen );
+
+                    if( hello_len < sizeof( SWP_SSLv3_hello )
+                                                          + sidlen + suiteslen )
+                        break;
+
+                    is_GOST = 0;
+
+                    for( i = 0; i < suiteslen / 2; i++ )
+                    {
+                        suite = ntohs( *(unsigned short *)( hello +
+                                 sidlen + sizeof( SWP_SSLv3_hello ) + i * 2 ) );
+
+                        if( IS_GOST_SPEC( suite ) )
+                        {
+                            is_GOST = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        break;
+    }
+
+    if( !is_GOST )
+    {
+        hc->addr_conf = &( (ngx_http_in_addr_t *)( (ngx_http_port_t *)
+                        c->listening->servers )->addrs )->conf;
+        hc->conf_ctx = ( (ngx_http_in_addr_t *)( (ngx_http_port_t *)
+                     c->listening->servers )->addrs )->conf.default_server->ctx;
+    }
+}
+
+// GOST_SWitchPatch END
+
             sscf = ngx_http_get_module_srv_conf(hc->conf_ctx,
                                                 ngx_http_ssl_module);
 
