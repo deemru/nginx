@@ -10,5 +10,5 @@ all:
 
 	ms\do_ms
 
-	$(MAKE) -f ms\nt.mak
-	$(MAKE) -f ms\nt.mak install
+	$(MAKE) -f ms\ntdll.mak
+	$(MAKE) -f ms\ntdll.mak install
