@@ -13,8 +13,8 @@ all:
 
 	if exist ms\do_ms.bat (						\
 		ms\do_ms						\
-		&& $(MAKE) -f ms\nt.mak					\
-		&& $(MAKE) -f ms\nt.mak install				\
+		&& $(MAKE) -f ms\ntdll.mak					\
+		&& $(MAKE) -f ms\ntdll.mak install				\
 	) else (							\
 		$(MAKE)							\
 		&& $(MAKE) install_sw					\
